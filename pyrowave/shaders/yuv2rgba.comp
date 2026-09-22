@@ -31,6 +31,8 @@ layout(push_constant) uniform Push {
     ivec2 src_size;   // decode (Y plane) resolution
     int   sharp;      // 1 = Catmull-Rom luma resampling (output != decode res)
     int   hdr;        // 1 = HDR10: BT.2020-NCL inverse, PQ passes through
+    ivec2 dst_offset; // top-left of the letterboxed content rect (output px)
+    ivec2 dst_size;   // size of the letterboxed content rect (output px)
 } pc;
 
 float fetchY(vec2 uv) {
@@ -76,7 +78,13 @@ void main() {
     if (p.x >= pc.size.x || p.y >= pc.size.y)
         return;
 
-    vec2 uv = (vec2(p) + 0.5) * pc.inv_size;
+    ivec2 rel = p - pc.dst_offset;
+    if (rel.x < 0 || rel.y < 0 || rel.x >= pc.dst_size.x || rel.y >= pc.dst_size.y) {
+        imageStore(OutRGBA, p, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    vec2 uv = (vec2(rel) + 0.5) / vec2(pc.dst_size);
     float y  = pc.sharp != 0 ? sampleY_catmullrom(uv) : fetchY(uv);
     float cb = textureLod(sampler2D(Cb, Samp), uv, 0.0).x;
     float cr = textureLod(sampler2D(Cr, Samp), uv, 0.0).x;

@@ -28,7 +28,31 @@ namespace {
   // Push constants for yuv2rgba.comp: output resolution + recip, source (decode)
   // resolution, and whether to use the sharper Catmull-Rom luma resampling
   // (enabled when output resolution != decode resolution).
-  struct ConvPush { int32_t w, h; float inv_w, inv_h; int32_t src_w, src_h; int32_t sharp; int32_t hdr; };
+  struct ConvPush { int32_t w, h; float inv_w, inv_h; int32_t src_w, src_h; int32_t sharp; int32_t hdr;
+                     int32_t dst_x, dst_y, dst_w, dst_h; };
+
+  // Largest rectangle that fits src_w x src_h inside dst_w x dst_h while
+  // preserving its aspect ratio, centered within the destination.
+  void computeLetterboxRect(int32_t srcW, int32_t srcH, int32_t dstW, int32_t dstH,
+                             int32_t &outX, int32_t &outY, int32_t &outW, int32_t &outH) {
+    if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) {
+      outX = outY = 0;
+      outW = dstW;
+      outH = dstH;
+      return;
+    }
+    const int64_t lhs = (int64_t) dstW * srcH;
+    const int64_t rhs = (int64_t) dstH * srcW;
+    if (lhs <= rhs) {
+      outW = dstW;
+      outH = (int32_t) std::max<int64_t>(1, lhs / srcW);
+    } else {
+      outH = dstH;
+      outW = (int32_t) std::max<int64_t>(1, rhs / srcH);
+    }
+    outX = (dstW - outW) / 2;
+    outY = (dstH - outH) / 2;
+  }
 
   // Push constants for overlay_blend.comp: overlay rect (top-left + size) in the target.
   struct OverlayPush { int32_t ox, oy, w, h; };
@@ -787,9 +811,15 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
         m_Cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *m_Pipe);
         m_Cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *m_Pl, 0, *m_Dset, {});
         const bool scaling = m_SwapExtent.width != uint32_t(m_Width) || m_SwapExtent.height != uint32_t(m_Height);
+
+        int32_t dstX, dstY, dstW, dstH;
+        computeLetterboxRect(m_Width, m_Height, (int32_t) m_SwapExtent.width, (int32_t) m_SwapExtent.height,
+                              dstX, dstY, dstW, dstH);
+
         ConvPush push {(int32_t) m_SwapExtent.width, (int32_t) m_SwapExtent.height,
                        1.0f / float(m_SwapExtent.width), 1.0f / float(m_SwapExtent.height),
-                       m_Width, m_Height, scaling ? 1 : 0, m_Hdr ? 1 : 0};
+                       m_Width, m_Height, scaling ? 1 : 0, m_Hdr ? 1 : 0,
+                       dstX, dstY, dstW, dstH};
         m_Cmd.pushConstants<ConvPush>(*m_Pl, vk::ShaderStageFlagBits::eCompute, 0, push);
         m_Cmd.dispatch((m_SwapExtent.width + 7) / 8, (m_SwapExtent.height + 7) / 8, 1);
 
@@ -822,7 +852,8 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
         m_Cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *m_Pipe);
         m_Cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *m_Pl, 0, *m_Dset, {});
         ConvPush push {m_Width, m_Height, 1.0f / float(m_Width), 1.0f / float(m_Height),
-                       m_Width, m_Height, 0, m_Hdr ? 1 : 0};
+                       m_Width, m_Height, 0, m_Hdr ? 1 : 0,
+                       0, 0, m_Width, m_Height};
         m_Cmd.pushConstants<ConvPush>(*m_Pl, vk::ShaderStageFlagBits::eCompute, 0, push);
         m_Cmd.dispatch((uint32_t(m_Width) + 7) / 8, (uint32_t(m_Height) + 7) / 8, 1);
 
@@ -840,11 +871,25 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
                 {}, vk::AccessFlagBits::eTransferWrite,
                 vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer);
 
+        int32_t dstX, dstY, dstW, dstH;
+        computeLetterboxRect(m_Width, m_Height, (int32_t) m_SwapExtent.width, (int32_t) m_SwapExtent.height,
+                              dstX, dstY, dstW, dstH);
+
+        if (dstW != (int32_t) m_SwapExtent.width || dstH != (int32_t) m_SwapExtent.height) {
+            vk::ClearColorValue black {};
+            black.setFloat32({0.0f, 0.0f, 0.0f, 1.0f});
+            m_Cmd.clearColorImage(m_SwapImages[idx], vk::ImageLayout::eTransferDstOptimal, black,
+                {vk::ImageSubresourceRange {.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1}});
+            barrier(m_SwapImages[idx], vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferDstOptimal,
+                    vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eTransferWrite,
+                    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer);
+        }
+
         vk::ImageBlit blit {
             .srcSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
             .srcOffsets = std::array<vk::Offset3D, 2> {vk::Offset3D {0, 0, 0}, vk::Offset3D {m_Width, m_Height, 1}},
             .dstSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
-            .dstOffsets = std::array<vk::Offset3D, 2> {vk::Offset3D {0, 0, 0}, vk::Offset3D {(int32_t) m_SwapExtent.width, (int32_t) m_SwapExtent.height, 1}},
+            .dstOffsets = std::array<vk::Offset3D, 2> {vk::Offset3D {dstX, dstY, 0}, vk::Offset3D {dstX + dstW, dstY + dstH, 1}},
         };
         m_Cmd.blitImage(m_ImgRgba, vk::ImageLayout::eTransferSrcOptimal,
                         m_SwapImages[idx], vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
